@@ -256,6 +256,8 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
      * @param lender The address of the lender.
      */
     function _lendToPool(uint256 poolId, uint256 amount, address lender) private {
+        require(lender != address(0), "Invalid lender address");
+
         // Access the struct at the specified address
         Pool storage pool = pools[poolId];
         Fee storage fee = fees[poolId];
@@ -263,21 +265,28 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         require(pool.status == 1, "Pool is not open for lend");
         require(block.timestamp <= pool.collectionTermEnd, "Pool term is ready to start");
 
+        uint256 erc1155Supply = _erc1155Contract.tokenSupply(poolId);
+        require(erc1155Supply < pool.targetLoan, "Pool is already full");
+
         uint256 adminFee;
         uint256 pairAmount;
         uint256 totalAmount = amount;
 
+        if(erc1155Supply + amount > pool.targetLoan) {
+            amount = pool.targetLoan - erc1155Supply;
+        }
+
         // calculate admin fee
-        if(fee.adminFee > 0) {
-            adminFee = amount.mul(fee.adminFee).div(10000);
-            totalAmount = amount.add(adminFee);
+        if (fee.adminFee > 0) {
+            adminFee = (amount * fee.adminFee) / 10000;
+            totalAmount = amount + adminFee;
         }
 
         // transfer from lender to lending contract
         pool.lendingCurrency.transferFrom(msg.sender, address(this), totalAmount);
 
         if (adminFee > 0) {
-            pool.lendingCurrency.transfer(feeAddress, adminFee);
+            require(pool.lendingCurrency.transfer(feeAddress, adminFee), "Admin fee transfer failed");
         }
 
         if(pool.stabletoPairRate > 0) {
@@ -351,13 +360,13 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         uint256 interestPerPayment = pool.targetInterestPerPayment;
 
         if(collectedPrincipal < pool.targetLoan) {
-            interestPerPayment = collectedPrincipal.mul(pool.targetInterestPerPayment).div(pool.targetLoan);
+            interestPerPayment = (collectedPrincipal * pool.targetInterestPerPayment) / pool.targetLoan;
         }
 
         activePools[poolId].interestPerPayment = interestPerPayment;
 
         if(fee.borrowerFee > 0) {
-            uint256 borrowFee = pool.targetLoan.mul(fee.borrowerFee).div(10000);
+            uint256 borrowFee = (pool.targetLoan * fee.borrowerFee) / 10000;
             require(borrowFee <= borrowMoney, "Borrow fee exceeds borrow amount");
         
             borrowMoney -= borrowFee;
@@ -368,7 +377,7 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
 
         totalLoanOrigination[address(pool.lendingCurrency)] += collectedPrincipal;
 
-        uint256 totalInterest = interestPerPayment.mul(pool.paymentFrequency);
+        uint256 totalInterest = interestPerPayment * pool.paymentFrequency;
         currentLoansOutstanding[address(pool.lendingCurrency)] += collectedPrincipal.add(totalInterest);
 
         emit Borrow(poolId, pool.borrower, borrowMoney);
@@ -405,6 +414,7 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         _erc1155Contract.burn(onBehalfOf, poolId, shares);
 
         pool.lendingCurrency.transfer(onBehalfOf, shares);
+
         pool.pairingCurrency.transfer(onBehalfOf, wagLocked[poolId][onBehalfOf]);
 
         totalValueLocked[address(pool.lendingCurrency)] -= shares;
@@ -413,19 +423,21 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
     }
 
     function durationPerTerm(uint256 loanTerm, uint256 paymentFrequency) public pure returns (uint256) {
-        return loanTerm.div(paymentFrequency);
+        require(paymentFrequency > 0, "Payment frequency must be greater than zero");
+
+        return loanTerm / paymentFrequency;
     }
 
     function getCurrentTermWithGracePeriod(uint256 termStart, uint256 loanTerm, uint256 paymentFrequency, uint256 latestRepayment, uint256 gracePeriod) public view returns (uint256) {
         uint256 _durationPerTerm = durationPerTerm(loanTerm, paymentFrequency); // 1000
 
         uint256 elapsedTime = block.timestamp > (termStart + gracePeriod) 
-            ? block.timestamp - termStart - gracePeriod // 1724777525 - 1724773090 - 600 = 3835
+            ? block.timestamp - termStart - gracePeriod
             : 0;
 
-        uint256 currentTerm = elapsedTime / _durationPerTerm + 1; // 3835 / 1000 + 1 = 4
+        uint256 currentTerm = elapsedTime / _durationPerTerm + 1;
 
-        if(currentTerm > paymentFrequency) currentTerm = paymentFrequency;
+        if (currentTerm > paymentFrequency) currentTerm = paymentFrequency;
 
         return currentTerm > latestRepayment ? currentTerm : latestRepayment;
     }
@@ -434,26 +446,28 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         if(latestRepayment == paymentFrequency) return 0;
         uint256 _durationPerTerm = durationPerTerm(loanTerm, paymentFrequency);
 
-        uint256 latestDeadlineTimestamp = termStart.add(latestRepayment.add(1).mul(_durationPerTerm)).add(fees[poolId].gracePeriodDuration);
+        uint256 latestDeadlineTimestamp = termStart + (latestRepayment + 1) * _durationPerTerm + fees[poolId].gracePeriodDuration;
 
         if (block.timestamp <= latestDeadlineTimestamp) return 0;
 
         uint256 lateDuration = block.timestamp - latestDeadlineTimestamp;
 
-        uint256 lateFeePerTerm = activePools[poolId].interestPerPayment.mul(fees[poolId].lateFee).div(10000);
-        uint256 numberOfLateTerm = lateDuration.div(fees[poolId].lateDuration).add(1);
-        
-        return numberOfLateTerm.mul(lateFeePerTerm);
+        uint256 lateFeePerTerm = activePools[poolId].interestPerPayment * fees[poolId].lateFee / 10000;
+        uint256 numberOfLateTerm = lateDuration / fees[poolId].lateDuration + 1;
+
+        return numberOfLateTerm * lateFeePerTerm;
     }
 
     function calculateAmountToRepay(uint256 poolId, uint256 currentTerm) internal view returns (uint256 interestPayment, uint256 principalPayment, uint256 latePayment) {
         Pool storage pool = pools[poolId];
 
-        uint256 termCountToPay = currentTerm.sub(pool.latestRepayment); // 2
-        interestPayment = activePools[poolId].interestPerPayment.mul(termCountToPay); // 2000
+        uint256 termCountToPay = currentTerm - pool.latestRepayment; 
+        interestPayment = activePools[poolId].interestPerPayment * termCountToPay; 
 
         if (currentTerm == pool.paymentFrequency) {
             principalPayment = activePools[poolId].collectedPrincipal;
+        } else {
+            principalPayment = 0; // Need to Check === Ensure principalPayment is initialized
         }
 
         latePayment = calculateLateFee(poolId, pool.loanTerm, pool.termStart, pool.latestRepayment, pool.paymentFrequency);
@@ -473,14 +487,14 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
 
         (uint256 interestPayment, uint256 principalPayment, uint256 latePayment) = calculateAmountToRepay(poolId, currentTerm);
 
-        return interestPayment.add(principalPayment).add(latePayment);
+        return interestPayment + principalPayment + latePayment;
     }
 
     function _applyProtocolFee(uint256 poolId, Pool storage pool, uint256 interestShares) internal returns (uint256) {
         if (fees[poolId].protocolFee > 0) {
-            uint256 protocolFee = interestShares.mul(fees[poolId].protocolFee).div(10000);
+            uint256 protocolFee = (interestShares * fees[poolId].protocolFee) / 10000;
             pool.lendingCurrency.transfer(feeAddress, protocolFee);
-            return interestShares.sub(protocolFee);
+            return interestShares - protocolFee;
         }
         return interestShares;
     }
@@ -498,14 +512,14 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         
         (uint256 interestPayment, uint256 principalPayment, uint256 latePayment) = calculateAmountToRepay(poolId, currentTerm);
         
-        uint256 amountToRepay = interestPayment.add(principalPayment);
+        uint256 amountToRepay = interestPayment + principalPayment;
 
         require(amountToRepay > 0, "Nothing to pay");
 
-        pool.lendingCurrency.transferFrom(msg.sender, address(this), amountToRepay);
+        require(pool.lendingCurrency.transferFrom(msg.sender, address(this), amountToRepay), "Transfer failed");
 
         if (latePayment > 0) {
-            pool.lendingCurrency.transferFrom(msg.sender, feeAddress, latePayment);
+            require(pool.lendingCurrency.transferFrom(msg.sender, feeAddress, latePayment), "Late payment transfer failed");
         }
 
         uint256 netInterest = _applyProtocolFee(poolId, pool, interestPayment);
@@ -536,7 +550,7 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         uint256 shares = _erc1155Contract.balanceOf(_address, poolId);
         if(shares == 0) return 0;
         
-        return shares.mul(activePools[poolId].interestPerPayment).div(totalShares);
+        return (shares * activePools[poolId].interestPerPayment) / totalShares;
     }
 
     /**
@@ -554,8 +568,9 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
 
         uint256 shares = _erc1155Contract.balanceOf(_address, poolId);
         uint256 totalShares = activePools[poolId].collectedPrincipal;
-        uint256 totalInterest = activePools[poolId].interestPerPayment.mul(pool.latestRepayment.sub(latestInterestClaimed[poolId][_address]));
-        interestShares = shares.mul(totalInterest).div(totalShares);
+        uint256 totalInterest = activePools[poolId].interestPerPayment * (pool.latestRepayment - latestInterestClaimed[poolId][_address]);
+        interestShares = (shares * totalInterest) / totalShares;
+
 
         principalShares = (pool.latestRepayment == pool.paymentFrequency) ? shares : 0;
         return (interestShares, principalShares);
@@ -575,13 +590,13 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         if(latestClaimed >= pool.latestRepayment) return 0;
 
         (uint256 interestShares, uint256 principalShares) = _calculateClaimableShares(poolId, _address);
-        return interestShares.add(principalShares);
+        return interestShares + principalShares;
     }
 
     function _applyProtocolFee(uint256 poolId, uint256 interestShares) internal view returns (uint256) {
         if (fees[poolId].protocolFee > 0) {
-            uint256 protocolFee = interestShares.mul(fees[poolId].protocolFee).div(10000);
-            return interestShares.sub(protocolFee);
+            uint256 protocolFee = (interestShares * fees[poolId].protocolFee) / 10000;
+            return interestShares - protocolFee;
         }
         return interestShares;
     }
@@ -592,6 +607,8 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
      * @param onBehalfOf The address of the user claiming the interest.
      */
     function claimInterest(uint256 poolId, address onBehalfOf) external nonReentrant whenNotPaused {
+        require(onBehalfOf != address(0), "Invalid address");
+
         Pool storage pool = pools[poolId];
         uint256 latestClaimed = latestInterestClaimed[poolId][onBehalfOf];
         uint256 paymentFreq = pool.paymentFrequency;
@@ -618,8 +635,8 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
 
         latestInterestClaimed[poolId][onBehalfOf] = latestRepayment;
 
-        uint256 amountToClaim = interestShares.add(principalShares);
-        pool.lendingCurrency.transfer(onBehalfOf, amountToClaim);
+        uint256 amountToClaim = interestShares + principalShares;
+        require(pool.lendingCurrency.transfer(onBehalfOf, amountToClaim), "Transfer failed");
 
         totalValueLocked[address(pool.lendingCurrency)] -= amountToClaim;
 
@@ -651,15 +668,15 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         if (principalShares > 0) {
             _erc1155Contract.burn(onBehalfOf, poolId, principalShares);
             if (wagAmount > 0) {
-                pool.pairingCurrency.transfer(onBehalfOf, wagAmount);
+                require(pool.pairingCurrency.transfer(onBehalfOf, wagAmount), "Transfer of WAG failed");
                 wagLocked[poolId][onBehalfOf] = 0;
             }
         }
 
         latestInterestClaimed[poolId][onBehalfOf] = latestRepayment;
 
-        uint256 amountToClaim = interestShares.add(principalShares);
-        pool.lendingCurrency.transfer(onBehalfOf, amountToClaim);
+        uint256 amountToClaim = interestShares + principalShares;
+        require(pool.lendingCurrency.transfer(onBehalfOf, amountToClaim), "Transfer of lending currency failed");
 
         totalValueLocked[address(pool.lendingCurrency)] -= amountToClaim;
 
@@ -691,7 +708,7 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         Pool storage pool = pools[poolId];
 
         uint256 unpaidTermsCount = pool.paymentFrequency - pool.latestRepayment;
-        return activePools[poolId].interestPerPayment.mul(unpaidTermsCount);
+        return activePools[poolId].interestPerPayment * unpaidTermsCount;
     }
 
     /**
@@ -709,7 +726,7 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         pool.status = 4;
         
         if(amount > 0) {
-            pool.lendingCurrency.transferFrom(defaultVault, address(this), amount);
+            require(pool.lendingCurrency.transferFrom(defaultVault, address(this), amount), "Transfer failed");
             activePool.defaultAmountToDisburse += amount;
         }
 
@@ -736,7 +753,7 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         require(pool.status == 4, "Pool is not in default");
         require(amount > 0, "Nothing to add");
 
-        pool.lendingCurrency.transferFrom(defaultVault, address(this), amount);
+        require(pool.lendingCurrency.transferFrom(defaultVault, address(this), amount), "Transfer failed");
         activePool.defaultAmountToDisburse += amount;
 
         address currency = address(pool.lendingCurrency);
@@ -771,12 +788,14 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         uint256 totalShares = activePools[poolId].collectedPrincipal;
         uint256 defaultAmount = activePools[poolId].defaultAmountToDisburse;
 
-        uint256 userDefaultShare = shares.mul(defaultAmount).div(totalShares);
+        require(totalShares > 0, "Total shares cannot be zero");
+
+        uint256 userDefaultShare = (shares * defaultAmount) / totalShares;
 
         defaultClaimed[poolId][onBehalfOf] = true;
         _erc1155Contract.burn(onBehalfOf, poolId, shares);
 
-        pool.lendingCurrency.transfer(onBehalfOf, userDefaultShare);
+        require(pool.lendingCurrency.transfer(onBehalfOf, userDefaultShare), "Transfer failed");
 
         totalValueLocked[address(pool.lendingCurrency)] -= userDefaultShare;
 
@@ -792,6 +811,6 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         require(amount > 0, "Amount to transfer is 0");
         require(_address != address(0), "Address cannot be zero");
         IERC20 erc20 = IERC20(_address);
-        erc20.transfer(msg.sender, amount);
+        require(erc20.transfer(msg.sender, amount), "Transfer failed");
     }
 }

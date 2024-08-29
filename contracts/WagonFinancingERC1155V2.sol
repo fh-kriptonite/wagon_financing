@@ -175,6 +175,7 @@ contract WagonFinancingERC1155V2 is ERC1155Upgradeable, AccessControlUpgradeable
                 uint256 id = ids[i];
                 uint256 amount = amounts[i];
 
+                require(tokenSupply[id] >= amount, "ERC1155: burn amount exceeds supply");
                 tokenSupply[id] -= amount;
             }
         }
