@@ -429,7 +429,7 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
     }
 
     function getCurrentTermWithGracePeriod(uint256 termStart, uint256 loanTerm, uint256 paymentFrequency, uint256 latestRepayment, uint256 gracePeriod) public view returns (uint256) {
-        uint256 _durationPerTerm = durationPerTerm(loanTerm, paymentFrequency); // 1000
+        uint256 _durationPerTerm = durationPerTerm(loanTerm, paymentFrequency);
 
         uint256 elapsedTime = block.timestamp > (termStart + gracePeriod) 
             ? block.timestamp - termStart - gracePeriod
@@ -590,6 +590,9 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         if(latestClaimed >= pool.latestRepayment) return 0;
 
         (uint256 interestShares, uint256 principalShares) = _calculateClaimableShares(poolId, _address);
+
+        interestShares = _applyProtocolFee(poolId, interestShares);
+        
         return interestShares + principalShares;
     }
 
