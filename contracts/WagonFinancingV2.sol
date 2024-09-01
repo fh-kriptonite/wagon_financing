@@ -268,18 +268,20 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
         uint256 erc1155Supply = _erc1155Contract.tokenSupply(poolId);
         require(erc1155Supply < pool.targetLoan, "Pool is already full");
 
-        uint256 adminFee;
+        uint256 adminFee = 0;
         uint256 pairAmount;
         uint256 totalAmount = amount;
+        uint256 excessAmount = 0;
 
         if(erc1155Supply + amount > pool.targetLoan) {
-            amount = pool.targetLoan - erc1155Supply;
+            uint256 neededAmount = pool.targetLoan - erc1155Supply;
+            excessAmount = amount - neededAmount;
+            amount = neededAmount;
         }
 
-        // calculate admin fee
         if (fee.adminFee > 0) {
             adminFee = (amount * fee.adminFee) / 10000;
-            totalAmount = amount + adminFee;
+            totalAmount += adminFee;
         }
 
         // transfer from lender to lending contract
@@ -287,6 +289,10 @@ contract WagonFinancingV2 is Initializable, AccessControlUpgradeable, Reentrancy
 
         if (adminFee > 0) {
             require(pool.lendingCurrency.transfer(feeAddress, adminFee), "Admin fee transfer failed");
+        }
+
+        if (excessAmount > 0) {
+            require(pool.lendingCurrency.transfer(lender, excessAmount), "Excess Amount transfer failed");
         }
 
         if(pool.stabletoPairRate > 0) {
